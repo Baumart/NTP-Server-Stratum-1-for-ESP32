@@ -2,6 +2,7 @@
 
 This project is an NTP server that synchronizes time using a GPS module. It provides precise time synchronization over a local network.
 Thanks to [Link](https://stuartsprojects.github.io/2024/09/21/How-not-to-read-a-GPS.html).
+And when you have problem with windows, look [here](https://learn.microsoft.com/en-us/troubleshoot/windows-server/active-directory/time-synchronization-not-succeed-non-ntp).
 
 ## 📜 Reference
 For NTP protocol details, refer to [RFC 5905](https://datatracker.ietf.org/doc/html/rfc5905).
