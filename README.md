@@ -28,5 +28,9 @@ For NTP protocol details, refer to [RFC 5905](https://datatracker.ietf.org/doc/h
 - Ensure the GPS module has a clear sky view for accurate time sync.
 - The system uses both GPS and NTP fallback for reliability.
 
-Happy time syncing! ⏱️
+## Not yet implemented
+- Leap Indicator changes
+- Reference Timestamp, dont say when the system clock was last set
+- Key Identifier
+- Message Digest
 
