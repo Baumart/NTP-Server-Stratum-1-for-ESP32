@@ -1,6 +1,7 @@
 # NTP Server for Home Setup
 
 This project is an NTP server that synchronizes time using a GPS module. It provides precise time synchronization over a local network.
+Thanks to [Link](https://stuartsprojects.github.io/2024/09/21/How-not-to-read-a-GPS.html).
 
 ## 📜 Reference
 For NTP protocol details, refer to [RFC 5905](https://datatracker.ietf.org/doc/html/rfc5905).
