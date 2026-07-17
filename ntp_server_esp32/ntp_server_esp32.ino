@@ -441,26 +441,29 @@ void ntpTask(void* param) {
       if (DEBUG_MODE) Serial.printf("[NTP] Malformed packet (%d B)\n", packetSize);
     }
 
-    // Periodic fallback sync
-    if (millis() - lastNtpSync > 30000) {
+    // Periodic fallback sync (FIXED: increased interval + only when no GPS)
+    // ISSUE: 30s updates caused spikes every 70-80s when NTP would fail over
+    // SOLUTION: Only sync if GPS unavailable, use 60s interval instead
+    uint8_t currentQuality = 0;
+    if (xSemaphoreTake(timingMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+      currentQuality = timingState.quality;
+      xSemaphoreGive(timingMutex);
+    }
+
+    if (currentQuality < 2 && millis() - lastNtpSync > 60000) {
       lastNtpSync = millis();
+      if (DEBUG_MODE) Serial.println("[NTP] Fallback sync attempt (GPS unavailable)");
       ntpClient.update();
       
-      uint8_t currentQuality = 0;
       if (xSemaphoreTake(timingMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
         currentQuality = timingState.quality;
-        xSemaphoreGive(timingMutex);
-      }
-
-      // Only update if we don't have GPS
-      if (currentQuality < 2 && ntpClient.isTimeSet()) {
-        if (xSemaphoreTake(timingMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+        if (currentQuality < 2 && ntpClient.isTimeSet()) {
           timingState.unixSec = ntpClient.getEpochTime();
           timingState.microsAtPps = esp_timer_get_time();
           timingState.quality = 1;
-          xSemaphoreGive(timingMutex);
-          if (DEBUG_MODE) Serial.printf("[NTP] Fallback sync: %llu\n", timingState.unixSec);
+          if (DEBUG_MODE) Serial.printf("[NTP] Fallback sync OK: %llu\n", timingState.unixSec);
         }
+        xSemaphoreGive(timingMutex);
       }
     }
 
