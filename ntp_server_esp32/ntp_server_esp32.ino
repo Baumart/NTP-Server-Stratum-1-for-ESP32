@@ -240,9 +240,10 @@ static void syncWithGps() {
   // 3. Keep existing sync if no new data
 
   if (gpsValid && ppsValid && !isPpsStale()) {
-    // GPS+PPS: The PPS pulse fires at the START of second N+1,
-    // but the NMEA sentence contains second N. So we use N+1.
-    timingState.unixSec = gpsEpoch + 1;
+    // GPS+PPS: Use GPS epoch directly. TinyGPSPlus already reports
+    // the correct NMEA time, so no +1 adjustment is needed.
+    // The PPS pulse synchronizes to the current second boundary.
+    timingState.unixSec = gpsEpoch;
     timingState.microsAtPps = lastPpsMicros;
     timingState.quality = 3;
   } else if (gpsValid) {
