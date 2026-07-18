@@ -106,6 +106,7 @@ volatile uint64_t lastPpsMicros = 0;
 volatile uint8_t  ppsCounter = 0;        // Count consecutive PPS pulses
 volatile bool     ppsValid = false;       // Is PPS currently valid?
 volatile uint64_t lastPpsSecTime = 0;    // When PPS became valid
+static portMUX_TYPE ppsMux = portMUX_INITIALIZER_UNLOCKED;
 
 // =============================================================================
 // SHARED STATE — Protected by mutexes
@@ -135,23 +136,33 @@ Adafruit_SSD1306 display(128, 64, &Wire, -1);
 
 void IRAM_ATTR handlePpsInterrupt() {
   uint64_t now = esp_timer_get_time();
-  
+  portENTER_CRITICAL_ISR(&ppsMux);
+
   // Ensure we have at least PPS_LOCK_CONFIRM_COUNT pulses before trusting
   if (ppsCounter < PPS_LOCK_CONFIRM_COUNT) {
     ppsCounter++;
     lastPpsMicros = now;
     if (ppsCounter == PPS_LOCK_CONFIRM_COUNT) {
       ppsValid = true;
-      lastPpsSecTime = esp_timer_get_time();
+      lastPpsSecTime = now;
+      if (DEBUG_MODE) Serial.println("[PPS] Locked");
     }
   } else {
     lastPpsMicros = now;
   }
+  portEXIT_CRITICAL_ISR(&ppsMux);
+}
+
+static uint64_t readLastPpsMicros() {
+  portENTER_CRITICAL(&ppsMux);
+  uint64_t val = lastPpsMicros;
+  portEXIT_CRITICAL(&ppsMux);
+  return val;
 }
 
 static bool isPpsStale() {
   if (!ppsValid) return true;
-  return (esp_timer_get_time() - lastPpsMicros) > PPS_STALE_US;
+  return (esp_timer_get_time() - readLastPpsMicros()) > PPS_STALE_US;
 }
 
 // =============================================================================
@@ -206,14 +217,17 @@ static PreciseTime getPreciseTime() {
   return pt;
 }
 
+static PreciseTime lastKnownGoodPt = {0, 0};
+
 static PreciseTime getPreciseTimeSafe() {
-  if (xSemaphoreTake(timingMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+  if (xSemaphoreTake(timingMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
     PreciseTime pt = getPreciseTime();
+    lastKnownGoodPt = pt;
     xSemaphoreGive(timingMutex);
     return pt;
   }
-  // Fallback: last known state (stale but safe)
-  return getPreciseTime();
+  // Fallback: last known state (stale but safe no torn-read)
+  return lastKnownGoodPt;
 }
 
 // =============================================================================
@@ -244,7 +258,7 @@ static void syncWithGps() {
     // the correct NMEA time, so no +1 adjustment is needed.
     // The PPS pulse synchronizes to the current second boundary.
     timingState.unixSec = gpsEpoch;
-    timingState.microsAtPps = lastPpsMicros;
+    timingState.microsAtPps = readLastPpsMicros();
     timingState.quality = 3;
   } else if (gpsValid) {
     // GPS only: sync at current time
@@ -295,8 +309,10 @@ static void sendNtpResponse(IPAddress remoteIp, uint16_t remotePort, uint8_t* re
 
   // Get current quality
   uint8_t quality = 0;
-  if (xSemaphoreTake(timingMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+  uint64_t refSyncSec = 0;
+  if (xSemaphoreTake(timingMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
     quality = timingState.quality;
+    refSyncSec = timingState.unixSec;
     xSemaphoreGive(timingMutex);
   }
 
@@ -337,7 +353,8 @@ static void sendNtpResponse(IPAddress remoteIp, uint16_t remotePort, uint8_t* re
 
   // Reference timestamp (last sync time, seconds only for stability)
   {
-    uint64_t refSec = timingState.unixSec + NTP_EPOCH_1900;
+    //uint64_t refSec = timingState.unixSec + NTP_EPOCH_1900;
+    uint64_t refSec = refSyncSec + NTP_EPOCH_1900;
     writeU64BE(ntpPacketBuffer, 16, refSec << 32);
   }
 
@@ -545,7 +562,7 @@ static void setupOled() {
   display.clearDisplay();
   display.display();
   display.setRotation(2);
-  display.setTextSize(2);
+  display.setTextSize(3);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
   display.println("ETH GPS NTP");
