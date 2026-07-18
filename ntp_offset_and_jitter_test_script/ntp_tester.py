@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-NTP Server Stripchart Monitor
-Real-time graphical offset monitoring in CLI
+NTP Server Real-Time Stripchart Monitor
+Real-time offset monitoring with live screen updates and final comparative plot
 """
 
 import ntplib
@@ -24,57 +24,57 @@ SERVERS = [
 INTERVAL = 5  # Seconds between measurements
 DURATION = 1800  # 30 minutes
 CHART_WIDTH = 60  # Characters wide
-CHART_HEIGHT = 20  # Lines tall
+CHART_HEIGHT = 15  # Lines tall
 
-CSV_FILE = "ntp_monitor.csv"
+CSV_FILE = "documents/ntp_monitor.csv"
 
 # Circular buffers for stripchart
 buffers = {srv: deque(maxlen=CHART_WIDTH) for srv in SERVERS}
 max_offset = 2000  # Initial scale
-
 client = ntplib.NTPClient()
 
 
 def scale_to_chart(offset_ms, max_val=2000):
-    """Convert offset to chart position (0-19)"""
+    """Convert offset to chart position (0-14)"""
     if offset_ms is None:
         return None
-    # Clamp to range
     pos = int((offset_ms / max_val) * (CHART_HEIGHT - 1))
     return max(0, min(CHART_HEIGHT - 1, pos))
 
 
-def draw_stripchart(buffers, max_offset):
-    """Draw ASCII stripchart"""
+def draw_stripchart(buffers, max_offset, spike_count):
+    """Draw ASCII stripchart for live display"""
     lines = []
 
     # Title
-    lines.append("+" + "=" * (CHART_WIDTH + 2) + "+")
-    lines.append("| NTP OFFSET STRIPCHART (ms) " + " " * (CHART_WIDTH - 26) + "|")
-    lines.append("+" + "=" * (CHART_WIDTH + 2) + "+")
+    lines.append("=" * 80)
+    lines.append("NTP OFFSET STRIPCHART MONITOR (Real-Time)")
+    lines.append("=" * 80)
 
     # Chart for each server
-    for server in SERVERS:
+    for idx, server in enumerate(SERVERS):
         buffer = buffers[server]
 
-        # Scale line
-        lines.append(f"| {server:18} |")
+        # Server name
+        lines.append(f"\n[{idx + 1}] {server:25}")
+        lines.append("-" * 80)
 
         # Chart rows (top to bottom = high to low offset)
         for row in range(CHART_HEIGHT):
-            line = "| " + " " * 18 + "|" + " " * CHART_WIDTH
-            chars = list(line)
-
-            # Plot points for this row
+            line = "| "
             for col, offset in enumerate(buffer):
                 if offset is not None:
                     pos = scale_to_chart(offset, max_offset)
                     if pos == (CHART_HEIGHT - 1 - row):
-                        chars[21 + col] = "#"  # Filled block
+                        line += "#"  # Filled block at this row
                     elif pos > (CHART_HEIGHT - 1 - row):
-                        chars[21 + col] = "."  # Dot below
-
-            lines.append("".join(chars))
+                        line += "."  # Dot below this row
+                    else:
+                        line += " "
+                else:
+                    line += " "
+            line += " |"
+            lines.append(line)
 
         # Min/Max/Avg
         valid = [o for o in buffer if o is not None]
@@ -82,15 +82,14 @@ def draw_stripchart(buffers, max_offset):
             min_o = min(valid)
             max_o = max(valid)
             avg_o = sum(valid) / len(valid)
-            stat_line = (f"| {server:18}| "
-                         f"min:{min_o:7.1f} avg:{avg_o:7.1f} max:{max_o:7.1f} ms")
-            lines.append(stat_line)
+            lines.append(f"| min: {min_o:8.2f} ms | avg: {avg_o:8.2f} ms | max: {max_o:8.2f} ms |")
+        else:
+            lines.append("| min: --- ms | avg: --- ms | max: --- ms |")
 
-        lines.append("+" + "-" * (CHART_WIDTH + 2) + "+")
-
-    # Scale reference
-    lines.append(f"| Scale: 0 to {max_offset} ms over {CHART_WIDTH} samples |")
-    lines.append("+" + "=" * (CHART_WIDTH + 2) + "+")
+    # Footer
+    lines.append("=" * 80)
+    lines.append(f"Scale: 0 to {max_offset} ms | Samples: {len(buffers['10.0.0.13'])} | Spikes: {spike_count}")
+    lines.append("Press Ctrl+C to stop and generate final plot...")
 
     return "\n".join(lines)
 
@@ -98,6 +97,59 @@ def draw_stripchart(buffers, max_offset):
 def clear_screen():
     """Clear terminal"""
     os.system('clear' if os.name != 'nt' else 'cls')
+
+
+def generate_final_plot(buffers, spike_count, total_samples):
+    """Generate final comparison plot with all servers"""
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        fig, axes = plt.subplots(5, 1, figsize=(14, 12), sharex=True)
+        fig.suptitle('NTP Offset Comparison - Final Results', fontsize=14, fontweight='bold')
+
+        colors = ['red', 'blue', 'green', 'orange', 'purple']
+
+        for idx, (server, ax) in enumerate(zip(SERVERS, axes)):
+            buffer = list(buffers[server])
+            x = np.arange(len(buffer))
+
+            # Filter None values
+            valid_indices = [i for i, v in enumerate(buffer) if v is not None]
+            valid_offsets = [buffer[i] for i in valid_indices]
+
+            if valid_offsets:
+                ax.plot(valid_indices, valid_offsets, marker='o', linestyle='-',
+                        color=colors[idx], label=server, markersize=4)
+                ax.set_ylabel('Offset (ms)')
+                ax.grid(True, alpha=0.3)
+                ax.legend(loc='upper right')
+
+                # Add statistics
+                min_o = min(valid_offsets)
+                max_o = max(valid_offsets)
+                avg_o = sum(valid_offsets) / len(valid_offsets)
+
+                stats_text = f'min:{min_o:.1f} | avg:{avg_o:.1f} | max:{max_o:.1f} ms'
+                ax.text(0.02, 0.95, stats_text, transform=ax.transAxes,
+                        verticalalignment='top', fontsize=9, bbox=dict(boxstyle='round',
+                                                                       facecolor='wheat', alpha=0.5))
+            else:
+                ax.text(0.5, 0.5, 'NO DATA', ha='center', va='center')
+                ax.set_ylabel('Offset (ms)')
+
+        axes[-1].set_xlabel('Sample Number')
+        plt.tight_layout()
+
+        # Save plot
+        plot_file = "documents/ntp_final_comparison.png"
+        plt.savefig(plot_file, dpi=150, bbox_inches='tight')
+        print(f"\nFinal plot saved: {plot_file}")
+        plt.close()
+
+    except ImportError:
+        print("\nMatplotlib not installed. Skipping plot generation.")
+        print("Install with: pip install matplotlib numpy")
 
 
 def monitor():
@@ -114,73 +166,87 @@ def monitor():
     spike_count = 0
     last_offset = {}
 
-    print("NTP Offset Monitor - Warming up...")
+    print("NTP Offset Monitor - Initializing...")
+    time.sleep(2)
 
-    while time.time() - start_time < DURATION:
-        now = datetime.now()
-        elapsed = time.time() - start_time
+    try:
+        while time.time() - start_time < DURATION:
+            now = datetime.now()
+            elapsed = time.time() - start_time
 
-        clear_screen()
-        print(f"Elapsed: {elapsed:.0f}s / {DURATION}s | Samples: {sample_count}")
-        print()
+            clear_screen()
 
-        # Measure all servers
-        for server in SERVERS:
-            try:
-                r = client.request(server, version=4, timeout=3)
-                offset = r.offset * 1000  # Convert to ms
-                delay = r.delay * 1000
+            # Status line
+            progress_pct = (elapsed / DURATION) * 100
+            print(
+                f"\nStatus: {progress_pct:.1f}% complete | Elapsed: {elapsed:.0f}s / {DURATION}s | Samples: {sample_count}\n")
 
-                # Detect spikes
-                if server in last_offset:
-                    delta = abs(offset - last_offset[server])
-                    if delta > 200:  # 200ms jump
-                        spike_count += 1
-                        spike_marker = " [SPIKE]"
-                    else:
-                        spike_marker = ""
-                else:
-                    spike_marker = ""
+            # Measure all servers
+            for server in SERVERS:
+                try:
+                    r = client.request(server, version=4, timeout=3)
+                    offset = r.offset * 1000  # Convert to ms
+                    delay = r.delay * 1000
 
-                last_offset[server] = offset
+                    # Detect spikes
+                    if server in last_offset:
+                        delta = abs(offset - last_offset[server])
+                        if delta > 200:  # 200ms jump
+                            spike_count += 1
 
-                # Update buffer
-                buffers[server].append(offset)
+                    last_offset[server] = offset
 
-                # Update scale
-                if offset > max_offset * 0.8:
-                    max_offset = max(max_offset, offset * 1.2)
+                    # Update buffer
+                    buffers[server].append(offset)
 
-                # Log to CSV
-                with open(CSV_FILE, "a", newline="") as f:
-                    writer = csv.writer(f)
-                    writer.writerow([now.isoformat(), server, offset, delay, r.stratum])
+                    # Update scale
+                    if offset > max_offset * 0.8:
+                        max_offset = max(max_offset, offset * 1.2)
 
-            except Exception as e:
-                buffers[server].append(None)
-                print(f"[ERROR] {server}: {e}")
+                    # Log to CSV
+                    with open(CSV_FILE, "a", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow([now.isoformat(), server, offset, delay, r.stratum])
 
-        # Draw chart
-        print(draw_stripchart(buffers, max_offset))
+                except Exception as e:
+                    buffers[server].append(None)
 
-        print(f"\nSpikes detected (>200ms): {spike_count}")
-        print(f"Logging to: {CSV_FILE}")
-        print("\nPress Ctrl+C to stop...")
+            # Draw chart
+            print(draw_stripchart(buffers, max_offset, spike_count))
 
-        sample_count += 1
-        time.sleep(INTERVAL)
+            sample_count += 1
+            time.sleep(INTERVAL)
 
-    print("\nMeasurement complete!")
+    except KeyboardInterrupt:
+        print("\n\nStopped by user - Generating final plot...\n")
+
+    # Final statistics
+    print("\n" + "=" * 80)
+    print("MEASUREMENT COMPLETE - FINAL STATISTICS")
+    print("=" * 80)
     print(f"Total samples: {sample_count}")
-    print(f"Total spikes: {spike_count}")
+    print(f"Total spikes (>200ms): {spike_count}")
     print(f"Data saved to: {CSV_FILE}")
+
+    print("\nPer-Server Summary:")
+    print("-" * 80)
+    for server in SERVERS:
+        valid = [o for o in buffers[server] if o is not None]
+        if valid:
+            print(
+                f"{server:25} | min: {min(valid):8.2f} | avg: {sum(valid) / len(valid):8.2f} | max: {max(valid):8.2f} ms")
+        else:
+            print(f"{server:25} | NO DATA")
+
+    # Generate final plot
+    print("\n" + "=" * 80)
+    generate_final_plot(buffers, spike_count, sample_count)
+    print("=" * 80)
 
 
 if __name__ == "__main__":
     try:
         monitor()
-    except KeyboardInterrupt:
-        print("\n\nStopped by user")
         sys.exit(0)
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
