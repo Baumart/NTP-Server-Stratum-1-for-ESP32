@@ -2,7 +2,9 @@
 
 A high-precision **Stratum-1 NTP server** for ESP32 that synchronizes time using a GPS module with PPS (Pulse Per Second) support. Provides precise time synchronization over Ethernet to local network devices.
 
-**Credits**: Thanks to [Stuart's Projects](https://stuartsprojects.github.io/2024/09/21/How-not-to-read-a-GPS.html) for GPS insights.
+**Credits**: Thanks to [Stuart's Projects](https://stuartsprojects.github.io/2024/09/21/How-not-to-read-a-GPS.html) for GPS insights. 
+And to [DennisSc](https://github.com/DennisSc/PPS-ntp-server) with his PPS NTP Server setup like mine, but with an other architecture.
+
 **Windows NTP Issues**: See [Microsoft's guide](https://learn.microsoft.com/en-us/troubleshoot/windows-server/active-directory/time-synchronization-not-succeed-non-ntp).
 
 ## 📜 Reference
