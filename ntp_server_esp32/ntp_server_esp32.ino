@@ -53,6 +53,12 @@ struct GpsSnapshot {
   uint32_t updateCount;
 };
 
+struct LeapState {
+  uint8_t leapIndicator;   // 0=no warning, 1=+1s, 2=-1s, 3=unsync
+  bool valid;
+  int8_t leapSeconds;      // GPS-UTC offset information
+};
+
 // =============================================================================
 // CONFIGURATION
 // =============================================================================
@@ -121,6 +127,12 @@ static SemaphoreHandle_t gpsMutex;       // Protects GPS data
 static TimingState timingState = {0, 0, 0};
 static GpsSnapshot gpsSnap = {0};
 static String timeSource = "NONE";       // Display only
+
+static LeapState leapState = {
+  3,      // Start: unsynchronized
+  false,
+  0
+};
 
 // =============================================================================
 // HARDWARE OBJECTS
@@ -233,6 +245,23 @@ static PreciseTime getPreciseTimeSafe() {
   return lastKnownGoodPt;
 }
 
+static uint8_t getLeapIndicator()
+{
+  uint8_t li;
+  if (xSemaphoreTake(timingMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+    if (timingState.quality == 0) {
+      li = 3;        // unsynchronized
+    } else {
+      li = leapState.leapIndicator;
+    }
+    xSemaphoreGive(timingMutex);
+  } else {
+    li = 3;
+  }
+
+  return li;
+}
+
 // =============================================================================
 // SYNCHRONIZATION LOGIC
 // =============================================================================
@@ -327,8 +356,11 @@ static void sendNtpResponse(IPAddress remoteIp, uint16_t remotePort, uint8_t* re
 
   memset(ntpPacketBuffer, 0, NTP_PACKET_SIZE);
 
-  // Byte 0: LI (0) | VN (4) | Mode (3)
-  ntpPacketBuffer[0] = 0x24;
+  uint8_t li = getLeapIndicator();
+
+
+  // LI | VN=4 | Mode=4
+  ntpPacketBuffer[0] = (li << 6) | (4 << 3) | 4;
   // Byte 1: Stratum
   ntpPacketBuffer[1] = usingGps ? 1 : (quality == 1 ? 2 : 16);
   // Byte 2: Poll (informational)
@@ -388,6 +420,23 @@ static void sendNtpResponse(IPAddress remoteIp, uint16_t remotePort, uint8_t* re
 // =============================================================================
 // FREERTOS TASKS
 // =============================================================================
+static void updateLeapState()
+{
+  if (xSemaphoreTake(timingMutex, pdMS_TO_TICKS(2)) != pdTRUE)
+    return;
+
+  if (gpsSnap.valid) {
+
+    leapState.valid = true;
+    leapState.leapIndicator = 0;
+
+  } else {
+    leapState.valid = false;
+    leapState.leapIndicator = 3;
+  }
+  xSemaphoreGive(timingMutex);
+}
+
 
 void gpsTask(void* param) {
   if (DEBUG_MODE) Serial.println("[gpsTask] Started");
@@ -414,6 +463,8 @@ void gpsTask(void* param) {
       }
       xSemaphoreGive(gpsMutex);
     }
+    // LeapSec
+    updateLeapState();
 
     // Attempt synchronization
     if (xSemaphoreTake(timingMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
