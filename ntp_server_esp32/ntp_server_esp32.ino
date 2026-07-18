@@ -83,10 +83,13 @@ IPAddress ETH_DNS    (10, 0, 0,  1);
 #define PPS_LOCK_CONFIRM_COUNT 3
 
 // OLED (SSD1306)
-#define PIN_OLED_SDA  23
-#define PIN_OLED_SCL  18
-#define OLED_ADDR     0x3C
-
+#define PIN_OLED_SDA   23
+#define PIN_OLED_SCL   18
+#define OLED_WIDTH     128
+#define OLED_HEIGHT     64
+#define OLED_RESET      -1
+#define OLED_ADDR  0x3C
+#define OLED_LINE_H     10
 // NTP
 #define NTP_PORT        123
 #define NTP_PACKET_SIZE 48
@@ -128,7 +131,7 @@ TinyGPSPlus      gps;
 EthernetUDP      ntpServerUDP;
 EthernetUDP      ntpFallbackUDP;
 NTPClient        ntpClient(ntpFallbackUDP, "pool.ntp.org", 0, 30000);
-Adafruit_SSD1306 display(128, 64, &Wire, -1);
+Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, OLED_RESET);
 
 // =============================================================================
 // PPS INTERRUPT — ZERO ALLOCATION, NO MUTEX
@@ -253,15 +256,18 @@ static void syncWithGps() {
   // 2. GPS only: sync now with GPS time
   // 3. Keep existing sync if no new data
 
+  static uint32_t lastSyncGpsEpoch = 0;
+
   if (gpsValid && ppsValid && !isPpsStale()) {
-    // GPS+PPS: Use GPS epoch directly. TinyGPSPlus already reports
-    // the correct NMEA time, so no +1 adjustment is needed.
-    // The PPS pulse synchronizes to the current second boundary.
-    timingState.unixSec = gpsEpoch;
-    timingState.microsAtPps = readLastPpsMicros();
-    timingState.quality = 3;
+    if (gpsEpoch != lastSyncGpsEpoch) {
+      // Neue Sekunde von NMEA bestätigt → PPS passt garantiert dazu
+      lastSyncGpsEpoch = gpsEpoch;
+      timingState.unixSec = gpsEpoch;
+      timingState.microsAtPps = readLastPpsMicros();
+      timingState.quality = 3;
+    }
+    // else: NMEA noch nicht aktualisiert → alten Sync behalten, nicht anfassen
   } else if (gpsValid) {
-    // GPS only: sync at current time
     timingState.unixSec = gpsEpoch;
     timingState.microsAtPps = esp_timer_get_time();
     timingState.quality = 2;
@@ -471,7 +477,7 @@ void ntpTask(void* param) {
       lastNtpSync = millis();
       if (DEBUG_MODE) Serial.println("[NTP] Fallback sync attempt (GPS unavailable)");
       ntpClient.update();
-      
+
       if (xSemaphoreTake(timingMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
         currentQuality = timingState.quality;
         if (currentQuality < 2 && ntpClient.isTimeSet()) {
@@ -486,6 +492,11 @@ void ntpTask(void* param) {
 
     vTaskDelay(pdMS_TO_TICKS(1));
   }
+}
+
+static void oledLine(int line, const String& text) {
+  display.setCursor(0, line * OLED_LINE_H);
+  display.println(text);
 }
 
 void displayTask(void* param) {
@@ -521,23 +532,23 @@ void displayTask(void* param) {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
-    
-    display.println("ETH GPS NTP Server");
-    display.println("IP: " + Ethernet.localIP().toString());
-    display.println(snap.valid ? "GPS OK" : "GPS WAIT");
-    display.printf("SAT:%d HDOP:%.1f\n", snap.satellites, snap.hdop);
-    
+
+    oledLine(0, "ETH GPS NTP Server");
+    oledLine(1, "IP: " + Ethernet.localIP().toString());
+    oledLine(2, snap.valid ? "GPS OK" : "GPS WAIT");
+    oledLine(3, "SAT:" + String(snap.satellites) + " HDOP:" + String(snap.hdop,1));
+
     if (quality == 3) {
-      display.println("SRC: GPS+PPS");
+      oledLine(4,"SRC: GPS+PPS");
     } else if (quality == 2) {
-      display.println("SRC: GPS");
+      oledLine(4, "SRC: GPS");
     } else if (quality == 1) {
-      display.println("SRC: NTP");
+      oledLine(4, "SRC: NTP");
     } else {
-      display.println("SRC: NONE");
+      oledLine(4, "SRC: NONE");
     }
-    
-    display.println(timeBuf);
+
+    oledLine(5, timeBuf);
     display.display();
 
     if (DEBUG_MODE) {
@@ -562,7 +573,7 @@ static void setupOled() {
   display.clearDisplay();
   display.display();
   display.setRotation(2);
-  display.setTextSize(3);
+  display.setTextSize(2);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
   display.println("ETH GPS NTP");
@@ -636,11 +647,11 @@ void setup() {
   setupEthernet();
 
   // Create tasks
-  xTaskCreatePinnedToCore(gpsTask,     "gpsTask",     4096, NULL, 
+  xTaskCreatePinnedToCore(gpsTask,     "gpsTask",     4096, NULL,
                           configMAX_PRIORITIES - 1, NULL, 1);
-  xTaskCreatePinnedToCore(ntpTask,     "ntpTask",     4096, NULL, 
+  xTaskCreatePinnedToCore(ntpTask,     "ntpTask",     4096, NULL,
                           configMAX_PRIORITIES - 2, NULL, 0);
-  xTaskCreatePinnedToCore(displayTask, "displayTask", 8192, NULL, 
+  xTaskCreatePinnedToCore(displayTask, "displayTask", 8192, NULL,
                           1, NULL, 0);
 
   if (DEBUG_MODE) Serial.println("[BOOT] All tasks started");
