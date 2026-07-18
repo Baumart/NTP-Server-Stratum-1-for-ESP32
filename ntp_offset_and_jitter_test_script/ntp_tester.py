@@ -100,37 +100,44 @@ def clear_screen():
 
 
 def generate_final_plot(buffers, spike_count, total_samples):
-    """Generate final comparison plot with all servers"""
+    """Generate final comparison plot with all servers (reads from CSV for complete data)"""
     try:
         import matplotlib.pyplot as plt
         import numpy as np
+        import pandas as pd
 
+        # Read all data from CSV file for complete picture
+        df = pd.read_csv(CSV_FILE)
+        
         fig, axes = plt.subplots(5, 1, figsize=(14, 12), sharex=True)
-        fig.suptitle('NTP Offset Comparison - Final Results', fontsize=14, fontweight='bold')
+        fig.suptitle('NTP Offset Comparison - Final Results (All Measurements)', fontsize=14, fontweight='bold')
 
         colors = ['red', 'blue', 'green', 'orange', 'purple']
 
         for idx, (server, ax) in enumerate(zip(SERVERS, axes)):
-            buffer = list(buffers[server])
-            x = np.arange(len(buffer))
+            # Get all data for this server from CSV
+            server_data = df[df['server'] == server].copy()
+            server_data['offset_ms'] = pd.to_numeric(server_data['offset_ms'], errors='coerce')
+            
+            # Remove NaN values
+            server_data = server_data.dropna(subset=['offset_ms'])
+            offsets = server_data['offset_ms'].values
+            x = np.arange(len(offsets))
 
-            # Filter None values
-            valid_indices = [i for i, v in enumerate(buffer) if v is not None]
-            valid_offsets = [buffer[i] for i in valid_indices]
-
-            if valid_offsets:
-                ax.plot(valid_indices, valid_offsets, marker='o', linestyle='-',
-                        color=colors[idx], label=server, markersize=4)
+            if len(offsets) > 0:
+                ax.plot(x, offsets, marker='o', linestyle='-',
+                        color=colors[idx], label=server, markersize=3, alpha=0.7)
                 ax.set_ylabel('Offset (ms)')
                 ax.grid(True, alpha=0.3)
                 ax.legend(loc='upper right')
 
                 # Add statistics
-                min_o = min(valid_offsets)
-                max_o = max(valid_offsets)
-                avg_o = sum(valid_offsets) / len(valid_offsets)
+                min_o = np.min(offsets)
+                max_o = np.max(offsets)
+                avg_o = np.mean(offsets)
+                std_o = np.std(offsets)
 
-                stats_text = f'min:{min_o:.1f} | avg:{avg_o:.1f} | max:{max_o:.1f} ms'
+                stats_text = f'n={len(offsets)} | min:{min_o:.1f} | avg:{avg_o:.1f} | max:{max_o:.1f} | σ:{std_o:.1f} ms'
                 ax.text(0.02, 0.95, stats_text, transform=ax.transAxes,
                         verticalalignment='top', fontsize=9, bbox=dict(boxstyle='round',
                                                                        facecolor='wheat', alpha=0.5))
@@ -138,18 +145,19 @@ def generate_final_plot(buffers, spike_count, total_samples):
                 ax.text(0.5, 0.5, 'NO DATA', ha='center', va='center')
                 ax.set_ylabel('Offset (ms)')
 
-        axes[-1].set_xlabel('Sample Number')
+        axes[-1].set_xlabel(f'Sample Number (Total: {len(df) // 5} measurements per server)')
         plt.tight_layout()
 
         # Save plot
-        plot_file = "documents/ntp_final_comparison.png"
+        plot_file = "documents/ntp_offset_V_2_2.png"
         plt.savefig(plot_file, dpi=150, bbox_inches='tight')
         print(f"\nFinal plot saved: {plot_file}")
+        print(f"Plot includes ALL {len(df)} CSV records (~{len(df)//5} per server)")
         plt.close()
 
     except ImportError:
-        print("\nMatplotlib not installed. Skipping plot generation.")
-        print("Install with: pip install matplotlib numpy")
+        print("\nMatplotlib or pandas not installed. Skipping plot generation.")
+        print("Install with: pip install matplotlib numpy pandas")
 
 
 def monitor():

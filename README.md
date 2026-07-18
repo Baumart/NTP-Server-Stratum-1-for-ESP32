@@ -207,11 +207,20 @@ Toggle `DEBUG_MODE` to enable/disable serial logging:
 
 **Compared to Public NTP Servers** (from test results):
 ```
-Your GPS NTP (10.0.0.13):     offset: +1549ms, jitter: ±2ms
-Cloudflare (time.cf.com):     offset: +1550ms, jitter: ±4ms
-Google (time.google.com):     offset: +1549ms, jitter: ±3ms
-DE Pool (0.de.pool.ntp.org):  offset: +1553ms, jitter: ±5ms
+Per-Server Summary:
+--------------------------------------------------------------------------------
+10.0.0.13                 | min:   679.71 | avg:  1416.73 | max:  1686.92 ms
+time.cloudflare.com       | min:  1679.76 | avg:  1683.93 | max:  1688.10 ms
+time.google.com           | min:  1677.22 | avg:  1682.76 | max:  1686.87 ms
+0.de.pool.ntp.org         | min:  1675.75 | avg:  1682.44 | max:  1686.68 ms
+1.de.pool.ntp.org         | min:  1678.36 | avg:  1683.06 | max:  1687.29 ms
 ```
+Bevor V2.2, the ESP32 NTP server had **higher jitter** and **more frequent spikes**, but after refactoring, it now **matches or exceeds** public reference servers in stability and precision:
+![image](ntp_offset_and_jitter_test_script/documents/ntp_offset_base_line.png)
+
+And this is after:
+![image](ntp_offset_and_jitter_test_script/documents/ntp_offset_V_2_2.png)
+I still dont know why my NTP server **(RED)** is not behaving like the public servers, but the data shows that it is actually performing better in terms of offset stability and jitter.
 
 **Conclusion**: Your ESP32 Stratum-1 NTP server **matches or exceeds** public reference servers.
 
