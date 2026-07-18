@@ -196,7 +196,9 @@ static uint32_t gpsToEpoch() {
 // =============================================================================
 
 static PreciseTime getPreciseTime() {
-  TimingState snap = timingState;  // Atomic read
+  xSemaphoreTake(timingMutex, portMAX_DELAY);
+  TimingState snap = timingState;
+  xSemaphoreGive(timingMutex);
   uint64_t now = esp_timer_get_time();
   uint64_t elapsed = now - snap.microsAtPps;
 
@@ -543,12 +545,15 @@ static void setupOled() {
     return;
   }
   display.clearDisplay();
-  display.setTextSize(1);
+  display.display();
+  display.setRotation(2);
+  display.setTextSize(2);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
   display.println("ETH GPS NTP");
   display.println("Booting...");
   display.display();
+  if (DEBUG_MODE) Serial.println("[OLED] Ready");
 }
 
 static void setupEthernet() {
