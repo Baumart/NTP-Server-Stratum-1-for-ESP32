@@ -149,7 +149,7 @@ def generate_final_plot(buffers, spike_count, total_samples):
         plt.tight_layout()
 
         # Save plot
-        plot_file = "documents/ntp_offset_V2_2.png"
+        plot_file = "documents/ntp_offset.png"
         plt.savefig(plot_file, dpi=150, bbox_inches='tight')
         print(f"\nFinal plot saved: {plot_file}")
         print(f"Plot includes ALL {len(df)} CSV records (~{len(df)//5} per server)")
