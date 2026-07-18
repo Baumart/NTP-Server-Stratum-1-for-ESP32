@@ -51,6 +51,9 @@ struct GpsSnapshot {
   uint8_t  satellites;
   float    hdop;
   uint32_t updateCount;
+  // UBX-NAV-TIMEGPS (Class 0x01, ID 0x20)
+  int8_t   leapS;       // GPS-UTC offset [s]; valid only if leapSValid
+  bool     leapSValid;  // Bit 2 of valid-field; true = leapS decoded from nav-msg
 };
 
 struct LeapState {
@@ -245,23 +248,6 @@ static PreciseTime getPreciseTimeSafe() {
   return lastKnownGoodPt;
 }
 
-static uint8_t getLeapIndicator()
-{
-  uint8_t li;
-  if (xSemaphoreTake(timingMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-    if (timingState.quality == 0) {
-      li = 3;        // unsynchronized
-    } else {
-      li = leapState.leapIndicator;
-    }
-    xSemaphoreGive(timingMutex);
-  } else {
-    li = 3;
-  }
-
-  return li;
-}
-
 // =============================================================================
 // SYNCHRONIZATION LOGIC
 // =============================================================================
@@ -356,8 +342,12 @@ static void sendNtpResponse(IPAddress remoteIp, uint16_t remotePort, uint8_t* re
 
   memset(ntpPacketBuffer, 0, NTP_PACKET_SIZE);
 
-  uint8_t li = getLeapIndicator();
+  uint8_t li = 3; // default: unsynchronized
 
+  if (xSemaphoreTake(timingMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+    li = leapState.leapIndicator;
+    xSemaphoreGive(timingMutex);
+  }
 
   // LI | VN=4 | Mode=4
   ntpPacketBuffer[0] = (li << 6) | (4 << 3) | 4;
@@ -420,23 +410,120 @@ static void sendNtpResponse(IPAddress remoteIp, uint16_t remotePort, uint8_t* re
 // =============================================================================
 // FREERTOS TASKS
 // =============================================================================
-static void updateLeapState()
-{
-  if (xSemaphoreTake(timingMutex, pdMS_TO_TICKS(2)) != pdTRUE)
-    return;
+// =============================================================================
+// UBX FRAME PARSER — state machine, no heap allocation
+// Processes interleaved binary UBX frames from gpsSerial alongside NMEA.
+// TinyGPSPlus silently ignores non-'$' bytes, so dual-feeding is safe.
+// =============================================================================
 
-  if (gpsSnap.valid) {
+enum UbxState : uint8_t {
+  UBX_IDLE, UBX_SYNC2, UBX_CLASS, UBX_ID,
+  UBX_LEN1, UBX_LEN2, UBX_PAYLOAD, UBX_CKA, UBX_CKB
+};
+static UbxState  ubxState  = UBX_IDLE;
+static uint8_t   ubxClass  = 0, ubxId = 0;
+static uint16_t  ubxLen    = 0, ubxIdx = 0;
+static uint8_t   ubxCalcA  = 0, ubxCalcB = 0;
+static uint8_t   ubxRxCkA  = 0;
+// NAV-TIMEGPS payload is 16 bytes; buffer capped to guard against large frames
+static uint8_t   ubxBuf[20];
 
-    leapState.valid = true;
-    leapState.leapIndicator = 0;
-
-  } else {
-    leapState.valid = false;
-    leapState.leapIndicator = 3;
+// Returns true if a complete, checksum-valid NAV-TIMEGPS frame was received.
+// All other valid UBX frames are silently consumed without signalling.
+static bool feedUbx(uint8_t b) {
+  switch (ubxState) {
+    case UBX_IDLE:
+      if (b == 0xB5) ubxState = UBX_SYNC2;
+      break;
+    case UBX_SYNC2:
+      ubxState = (b == 0x62) ? UBX_CLASS : UBX_IDLE;
+      break;
+    case UBX_CLASS:
+      ubxClass = b; ubxCalcA = b; ubxCalcB = b;
+      ubxState = UBX_ID;
+      break;
+    case UBX_ID:
+      ubxId = b; ubxCalcA += b; ubxCalcB += ubxCalcA;
+      ubxState = UBX_LEN1;
+      break;
+    case UBX_LEN1:
+      ubxLen = b; ubxCalcA += b; ubxCalcB += ubxCalcA;
+      ubxState = UBX_LEN2;
+      break;
+    case UBX_LEN2:
+      ubxLen |= ((uint16_t)b << 8); ubxCalcA += b; ubxCalcB += ubxCalcA;
+      ubxIdx  = 0;
+      ubxState = (ubxLen > 0) ? UBX_PAYLOAD : UBX_CKA;
+      break;
+    case UBX_PAYLOAD:
+      if (ubxIdx < sizeof(ubxBuf)) ubxBuf[ubxIdx] = b;
+      ubxCalcA += b; ubxCalcB += ubxCalcA;
+      if (++ubxIdx >= ubxLen) ubxState = UBX_CKA;
+      break;
+    case UBX_CKA:
+      ubxRxCkA = b; ubxState = UBX_CKB;
+      break;
+    case UBX_CKB:
+      ubxState = UBX_IDLE;
+      return (ubxClass == 0x01 && ubxId == 0x20
+              && ubxLen == 16
+              && ubxRxCkA == ubxCalcA && b == ubxCalcB);
   }
-  xSemaphoreGive(timingMutex);
+  return false;
 }
 
+// Called under gpsMutex after feedUbx() returns true.
+static void parseUbxNavTimeGps(GpsSnapshot& snap) {
+  // Payload layout (u-blox 6 Protocol Spec, Table NAV-TIMEGPS):
+  //   Byte 10: leapS   (I1) — GPS-UTC leap seconds
+  //   Byte 11: valid   (X1) — bit2 = leapSValid
+  if (ubxLen < 12) return;
+  snap.leapS      = (int8_t)ubxBuf[10];
+  snap.leapSValid = (ubxBuf[11] & 0x04) != 0;
+}
+
+static void updateLeapState() {
+  // Step 1: Read GPS leap data under gpsMutex (copy to locals, no nesting)
+  int8_t leapS      = 0;
+  bool   leapSValid = false;
+  bool   gpsValid   = false;
+
+  if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+    gpsValid   = gpsSnap.valid;
+    leapS      = gpsSnap.leapS;
+    leapSValid = gpsSnap.leapSValid;
+    xSemaphoreGive(gpsMutex);
+  } else {
+    return; // can't read GPS state, leave leapState unchanged
+  }
+
+  // Step 2: Update leapState under timingMutex
+  // Lock ordering: gpsMutex released above → safe to acquire timingMutex.
+  // (syncWithGps uses timingMutex→gpsMutex; no inversion possible here.)
+  if (xSemaphoreTake(timingMutex, pdMS_TO_TICKS(2)) != pdTRUE) return;
+
+  if (timingState.quality == 0) {
+    // No time source at all
+    leapState.leapIndicator = 3;
+    leapState.valid         = false;
+
+  } else if (gpsValid && leapSValid) {
+    // GPS synchronized and leap second offset confirmed by navigation message.
+    // NEO-6M (u-blox 6) provides no tLSF/WNlsf (future event fields).
+    // LI=1 or LI=2 require advance knowledge of the event → not possible here.
+    // LI=0 is therefore the only correct value: synchronized, no event announced.
+    leapState.leapIndicator = 0;
+    leapState.valid         = true;
+    leapState.leapSeconds   = leapS;
+
+  } else {
+    // GPS fix present but leapS not yet decoded from nav subframe
+    leapState.leapIndicator = 3;
+    leapState.valid         = false;
+  }
+
+  xSemaphoreGive(timingMutex);
+}
 
 void gpsTask(void* param) {
   if (DEBUG_MODE) Serial.println("[gpsTask] Started");
@@ -650,25 +737,43 @@ static void setupEthernet() {
 static void setupGps() {
   gpsSerial.begin(GPS_BAUD, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
   delay(300);
-  while (gpsSerial.available()) gpsSerial.read();
+  // Feed serial bytes to both TinyGPSPlus (NMEA) and the UBX state machine.
+  // TinyGPSPlus ignores non-'$' bytes, so dual-feeding is safe.
+  while (gpsSerial.available()) {
+    uint8_t b = (uint8_t)gpsSerial.read();
+    gps.encode((char)b);
 
-  unsigned long t = millis();
-  bool found = false;
-  while (millis() - t < 2000) {
-    if (gpsSerial.available() && gpsSerial.peek() == '$') {
-      found = true;
-      break;
+    if (feedUbx(b)) {
+      // Complete, checksum-valid NAV-TIMEGPS frame
+      if (xSemaphoreTake(gpsMutex, pdMS_TO_TICKS(1)) == pdTRUE) {
+        parseUbxNavTimeGps(gpsSnap);
+        xSemaphoreGive(gpsMutex);
+        if (DEBUG_MODE)
+          Serial.printf("[GPS] leapS=%d valid=%d\n", gpsSnap.leapS, gpsSnap.leapSValid);
+      }
     }
-    if (gpsSerial.available()) gpsSerial.read();
   }
-  if (!found && DEBUG_MODE) Serial.println("[GPS] WARNING: no NMEA detected");
-
   delay(200);
   while (gpsSerial.available()) gpsSerial.read();
 
   pinMode(PIN_PPS, INPUT);
   attachInterrupt(digitalPinToInterrupt(PIN_PPS), handlePpsInterrupt, RISING);
   if (DEBUG_MODE) Serial.printf("[GPS] PPS on GPIO %d\n", PIN_PPS);
+  // Enable UBX-NAV-TIMEGPS @ 1 Hz on UART1 (CFG-MSG, 8-byte payload)
+  // Checksum covers bytes [class..payload]: CK_A=0x31, CK_B=0x90
+  static const uint8_t ubxEnableNavTimeGps[] = {
+    0xB5, 0x62,              // sync
+    0x06, 0x01,              // class=CFG, id=MSG
+    0x08, 0x00,              // payload length
+    0x01, 0x20,              // msgClass=NAV, msgId=TIMEGPS
+    0x00,                    // I2C   rate = 0
+    0x01,                    // UART1 rate = 1 (1 frame per epoch)
+    0x00, 0x00, 0x00, 0x00,  // UART2, USB, SPI, reserved
+    0x31, 0x90               // CK_A, CK_B
+  };
+  gpsSerial.write(ubxEnableNavTimeGps, sizeof(ubxEnableNavTimeGps));
+  delay(100);
+  if (DEBUG_MODE) Serial.println("[GPS] UBX NAV-TIMEGPS enabled @ 1 Hz");
 }
 
 // =============================================================================
