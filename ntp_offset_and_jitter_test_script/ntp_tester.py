@@ -26,7 +26,7 @@ DURATION = 1800  # 30 minutes
 CHART_WIDTH = 60  # Characters wide
 CHART_HEIGHT = 15  # Lines tall
 
-CSV_FILE = "documents/ntp_monitor_V2_2.csv"
+CSV_FILE = "documents/ntp_monitor.csv"
 
 # Circular buffers for stripchart
 buffers = {srv: deque(maxlen=CHART_WIDTH) for srv in SERVERS}
