@@ -196,9 +196,7 @@ static uint32_t gpsToEpoch() {
 // =============================================================================
 
 static PreciseTime getPreciseTime() {
-  xSemaphoreTake(timingMutex, portMAX_DELAY);
   TimingState snap = timingState;
-  xSemaphoreGive(timingMutex);
   uint64_t now = esp_timer_get_time();
   uint64_t elapsed = now - snap.microsAtPps;
 
@@ -601,7 +599,7 @@ static void setupGps() {
 void setup() {
   Serial.begin(115200);
   delay(300);
-  if (DEBUG_MODE) Serial.println("\n[BOOT] ESP32 ETH GPS NTP Server (Refactored)");
+  if (DEBUG_MODE) Serial.println("[BOOT] ESP32 ETH GPS NTP Server (Refactored)");
 
   // Create mutexes
   timingMutex = xSemaphoreCreateMutex();
