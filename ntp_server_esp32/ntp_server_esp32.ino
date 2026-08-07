@@ -83,7 +83,7 @@ IPAddress ETH_DNS    (10, 0, 0,  1);
 // GPS (NEO-6M)
 #define PIN_GPS_RX      16
 #define PIN_GPS_TX      17
-#define GPS_BAUD        9600
+#define GPS_BAUD        38400
 #define GPS_MIN_VALID   1700000000UL
 
 // PPS
@@ -711,7 +711,7 @@ static void setupOled() {
   display.clearDisplay();
   display.display();
   display.setRotation(2);
-  display.setTextSize(2);
+  display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 0);
   display.println("ETH GPS NTP");
