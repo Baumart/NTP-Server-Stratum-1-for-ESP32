@@ -449,8 +449,15 @@ time.google.com           | 1048.05   | 1052.05   | 1056.71
 **Conclusion:** ESP32 Stratum-1 server **matches or exceeds** public reference servers in stability and precision.
 
 **Performance Plots:**
+
+**V1:**
 ![image](ntp_offset_and_jitter_test_script/documents/ntp_offset_base_line.png)
 
+**V2:**
+![image](ntp_offset_and_jitter_test_script/documents/ntp_offset_V2_2.png)
+
+**V3 (release version listet as V1, its first release):**
+![image](ntp_offset_and_jitter_test_script/documents/ntp_offset_leapsec.png)
 ---
 
 ## Dependencies
