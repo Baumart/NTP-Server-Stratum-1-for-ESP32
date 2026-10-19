@@ -108,10 +108,10 @@ struct LeapState {
 #define PIN_ETH_MOSI  25
 #define ETH_SPI_FREQ  8000000
 byte      ETH_MAC[]  = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
-IPAddress ETH_IP     (10, 0, 0, 13);
-IPAddress ETH_GATEWAY(10, 0, 0,  1);
-IPAddress ETH_SUBNET (255, 255, 0, 0);
-IPAddress ETH_DNS    (10, 0, 0,  1);
+IPAddress ETH_IP     (172, 16, 3, 35);
+IPAddress ETH_GATEWAY(172, 16, 3,  1);
+IPAddress ETH_SUBNET (255, 255, 255, 0);
+IPAddress ETH_DNS    (172, 16, 3,  1);
 
 // GPS u-blox M9N
 #define PIN_GPS_RX     16
