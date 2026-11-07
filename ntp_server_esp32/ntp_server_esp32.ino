@@ -124,6 +124,10 @@ IPAddress ETH_DNS    (172, 16, 3,  1);
 #define PPS_STALE_US            2100000ULL
 #define PPS_LOCK_CONFIRM_COUNT  3
 
+// W5500 INTn — RX arrival timestamp for NTP T2
+#define PIN_ETH_INT          33
+#define ETH_INT_MAX_AGE_US   20000ULL
+
 // OLED SSD1306
 #define PIN_OLED_SDA  23
 #define PIN_OLED_SCL  18
@@ -141,10 +145,9 @@ IPAddress ETH_DNS    (172, 16, 3,  1);
 #define NTP_PREC_NMEA   0xF0   // 2^-16 ≈ 15 µs (GPS only)
 #define NTP_PREC_NTP    0xF6   // 2^-10 ≈ 1 ms  (NTP fallback)
 // Static root dispersion fallbacks (NTP short 16.16 format):
-#define NTP_DISP_GPS    0x0008  // ≈ 122 µs — used when tAcc=0
-#define NTP_DISP_NMEA   0x0030  // ≈ 732 µs
-#define NTP_DISP_NTP    0x0050  // ≈ 1.2 ms
-
+#define NTP_DISP_GPS    0x0050      // ≈ 1.2 ms — floor: T2 uncertainty (1 ms polling + SPI); also used when tAcc=0
+#define NTP_DISP_NMEA   0x00010000  // 1.0 s — NMEA-only anchor without PPS is off by 100 ms+
+#define NTP_DISP_NTP    0x00010000  // 1.0 s — NTPClient delivers whole seconds only
 // =============================================================================
 // VOLATILE STATE — ISR writes only
 // =============================================================================
@@ -154,6 +157,13 @@ volatile uint8_t     ppsCounter     = 0;
 volatile bool        ppsValid       = false;
 volatile uint64_t    lastPpsSecTime = 0;
 static portMUX_TYPE  ppsMux         = portMUX_INITIALIZER_UNLOCKED;
+
+// W5500 INTn ISR — arrival time of last datagram (esp_timer µs), 0 = none
+volatile uint64_t    lastEthIntMicros = 0;
+volatile uint32_t    ethIntCount      = 0;
+static portMUX_TYPE  ethIntMux        = portMUX_INITIALIZER_UNLOCKED;
+static uint64_t      t2IntUs          = 0;   // stamp consumed for the current request (ntpTask only)
+static uint32_t      t2LateUs         = 0;   // poll+SPI latency of that request (diagnostics)
 
 // UBX message watchdog — gpsTask detects silent CFG-MSG failures
 volatile uint32_t ubxMsgTimestamps[4] = { 0, 0, 0, 0 };  // [0]=TIMEGPS, [1]=CLOCK, [2]=STATUS, [3]=TIMELS
@@ -213,6 +223,14 @@ static bool isPpsStale() {
   return (esp_timer_get_time() - readLastPpsMicros()) > PPS_STALE_US;
 }
 
+void IRAM_ATTR handleEthInterrupt() {
+  uint64_t now = esp_timer_get_time();
+  portENTER_CRITICAL_ISR(&ethIntMux);
+  lastEthIntMicros = now;
+  ethIntCount++;
+  portEXIT_CRITICAL_ISR(&ethIntMux);
+}
+
 // =============================================================================
 // GPS HELPERS
 // =============================================================================
@@ -259,17 +277,45 @@ static PreciseTime getPreciseTime() {
 }
 
 static PreciseTime lastKnownGoodPt = { 0, 0 };
+static uint64_t    lastKnownGoodUs = 0;      // esp_timer at lastKnownGoodPt
+static volatile uint32_t ptFallbackCount = 0;
 
 static PreciseTime getPreciseTimeSafe() {
   if (xSemaphoreTake(timingMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
     PreciseTime pt  = getPreciseTime();
     lastKnownGoodPt = pt;
+    lastKnownGoodUs = esp_timer_get_time();
     xSemaphoreGive(timingMutex);
     return pt;
   }
-  return lastKnownGoodPt;  // stale but no torn read
+  // Mutex timeout: advance the last good value by the elapsed time instead of returning it stale
+  ptFallbackCount++;
+  if (lastKnownGoodUs == 0) return lastKnownGoodPt;
+  PreciseTime pt = lastKnownGoodPt;
+  uint64_t add   = esp_timer_get_time() - lastKnownGoodUs;
+  uint64_t us    = pt.microseconds + add % 1000000ULL;
+  pt.seconds      += add / 1000000ULL + us / 1000000ULL;
+  pt.microseconds  = (uint32_t)(us % 1000000ULL);
+  return pt;
 }
 
+
+// Time at an earlier esp_timer instant (INTn arrival), same anchor as getPreciseTime()
+static PreciseTime getPreciseTimeAtSafe(uint64_t atUs) {
+  if (xSemaphoreTake(timingMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+    TimingState s = timingState;
+    xSemaphoreGive(timingMutex);
+    int64_t elapsed = (int64_t)(atUs - s.microsAtPps);
+    int64_t sec     = elapsed / 1000000LL;
+    int64_t us      = elapsed % 1000000LL;
+    if (us < 0) { us += 1000000LL; sec--; }
+    PreciseTime pt;
+    pt.seconds      = (uint64_t)((int64_t)s.unixSec + sec);
+    pt.microseconds = (uint32_t)us;
+    return pt;
+  }
+  return getPreciseTimeSafe();
+}
 // =============================================================================
 // SYNCHRONIZATION
 // =============================================================================
@@ -344,7 +390,7 @@ static uint8_t ntpPacketBuffer[NTP_PACKET_SIZE];
 
 static void sendNtpResponse(IPAddress remoteIp, uint16_t remotePort, uint8_t* request) {
   // Capture receive timestamp first — minimises T2 measurement error
-  PreciseTime recvTime = getPreciseTimeSafe();
+  PreciseTime recvTime = (t2IntUs != 0) ? getPreciseTimeAtSafe(t2IntUs) : getPreciseTimeSafe();
 
   // Read all timingMutex-protected state in a single critical section
   uint8_t  quality      = 0;
@@ -370,11 +416,11 @@ static void sendNtpResponse(IPAddress remoteIp, uint16_t remotePort, uint8_t* re
   if (jamming) li = 3;
 
   // Dynamic root dispersion from NAV-CLOCK tAcc [ns] → NTP short 16.16 [s]
-  // Formula: d = tAccNs * 65536 / 1e9   (floor at 1 ≈ 15 µs, cap at 0xFFFF ≈ 1 s)
+  // Formula: d = tAccNs * 65536 / 1e9   (floor NTP_DISP_GPS ≈ 1.2 ms, cap at 0xFFFF ≈ 1 s)
   uint32_t rootDisp;
   if (usingPps && tAccNs > 0) {
     uint64_t d = ((uint64_t)tAccNs * 65536ULL + 500000000ULL) / 1000000000ULL;
-    if (d < 1)      d = 1;
+    if (d < NTP_DISP_GPS) d = NTP_DISP_GPS;
     if (d > 0xFFFF) d = 0xFFFF;
     rootDisp = (uint32_t)d;
   } else {
@@ -387,7 +433,7 @@ static void sendNtpResponse(IPAddress remoteIp, uint16_t remotePort, uint8_t* re
 
   memset(ntpPacketBuffer, 0, NTP_PACKET_SIZE);
 
-  ntpPacketBuffer[0] = (li << 6) | (4 << 3) | 4;  // LI | VN=4 | Mode=4 (server)
+  ntpPacketBuffer[0] = (li << 6) | (((request[0] >> 3) & 0x07) << 3) | 4;  // LI | VN=echo | Mode=4 (server)
   ntpPacketBuffer[1] = stratum;
   ntpPacketBuffer[2] = 4;                            // Poll exponent (informational)
   ntpPacketBuffer[3] = usingPps ? NTP_PREC_GPS
@@ -429,9 +475,10 @@ static void sendNtpResponse(IPAddress remoteIp, uint16_t remotePort, uint8_t* re
   ntpServerUDP.endPacket();
 
   if (DEBUG_MODE)
-    Serial.printf("[NTP] → %s:%u  st=%u li=%u disp=0x%04X tAcc=%uns\n",
+    Serial.printf("[NTP] → %s:%u  st=%u li=%u disp=0x%04X tAcc=%uns t2=%s late=%uus\n",
                   remoteIp.toString().c_str(), remotePort,
-                  stratum, li, rootDisp, tAccNs);
+                  stratum, li, rootDisp, tAccNs,
+                  t2IntUs ? "INT" : "poll", (unsigned)t2LateUs);
 }
 
 // =============================================================================
@@ -638,7 +685,7 @@ static void updateLeapState() {
   } else if (gpsValid && leapSValid) {
     // GPS synchronized with known current leap seconds
     // Check if future leap second event is known (LI=1 or LI=2)
-    if (lsChangeValid && lsChange != 0 && timeToLsEvent > 0) {
+    if (lsChangeValid && lsChange != 0 && timeToLsEvent > 0 && timeToLsEvent <= 86400) {
       // Future LS event pending: positive (LI=1) or negative (LI=2)
       leapState.leapIndicator = (lsChange > 0) ? 1 : 2;
       leapState.valid         = true;
@@ -803,6 +850,61 @@ void gpsTask(void* param) {
 // NTP TASK — Core 0
 // =============================================================================
 
+// =============================================================================
+// W5500 INTn — raw SPI access (VDM frame: addr[16] | ctrl[BSB<<3, RWB<<2] | data)
+// Common block BSB=0; socket n register block BSB=4n+1.
+// =============================================================================
+
+static int8_t ethIntSocket = -1;   // W5500 socket index of the NTP UDP socket, -1 = INT unused
+
+static uint8_t w5500Read(uint16_t addr, uint8_t bsb) {
+  SPI.beginTransaction(SPISettings(ETH_SPI_FREQ, MSBFIRST, SPI_MODE0));
+  digitalWrite(PIN_ETH_CS, LOW);
+  SPI.transfer(addr >> 8);
+  SPI.transfer(addr & 0xFF);
+  SPI.transfer((uint8_t)(bsb << 3));            // RWB=0 (read), OM=00 (VDM)
+  uint8_t v = SPI.transfer(0);
+  digitalWrite(PIN_ETH_CS, HIGH);
+  SPI.endTransaction();
+  return v;
+}
+
+static void w5500Write(uint16_t addr, uint8_t bsb, uint8_t v) {
+  SPI.beginTransaction(SPISettings(ETH_SPI_FREQ, MSBFIRST, SPI_MODE0));
+  digitalWrite(PIN_ETH_CS, LOW);
+  SPI.transfer(addr >> 8);
+  SPI.transfer(addr & 0xFF);
+  SPI.transfer((uint8_t)((bsb << 3) | 0x04));   // RWB=1 (write), OM=00 (VDM)
+  SPI.transfer(v);
+  digitalWrite(PIN_ETH_CS, HIGH);
+  SPI.endTransaction();
+}
+
+static void setupEthInterrupt() {
+  // Guard: VERSIONR (0x0039) of a W5500 reads 0x04 — otherwise raw framing is wrong, keep polled T2
+  if (w5500Read(0x0039, 0) != 0x04) {
+    if (DEBUG_MODE) Serial.println("[ETH] INT: VERSIONR != 0x04 — T2 stays polled");
+    return;
+  }
+  // Find the socket the library opened for UDP port NTP_PORT (Sn_SR==0x22 SOCK_UDP, Sn_PORT)
+  for (uint8_t n = 0; n < 8; n++) {
+    const uint8_t  bsb  = 4 * n + 1;
+    const uint16_t port = ((uint16_t)w5500Read(0x0004, bsb) << 8) | w5500Read(0x0005, bsb);
+    if (w5500Read(0x0003, bsb) == 0x22 && port == NTP_PORT) { ethIntSocket = n; break; }
+  }
+  if (ethIntSocket < 0) {
+    if (DEBUG_MODE) Serial.println("[ETH] INT: NTP socket not found — T2 stays polled");
+    return;
+  }
+  const uint8_t bsb = 4 * ethIntSocket + 1;
+  w5500Write(0x002C, bsb, 0x04);                          // Sn_IMR: RECV only
+  w5500Write(0x0002, bsb, 0x04);                          // Sn_IR : clear pending RECV (write-1-to-clear)
+  w5500Write(0x0018, 0, (uint8_t)(1 << ethIntSocket));    // SIMR  : only this socket may drive INTn
+  pinMode(PIN_ETH_INT, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_ETH_INT), handleEthInterrupt, FALLING);
+  if (DEBUG_MODE) Serial.printf("[ETH] INT: socket %d, GPIO %d armed\n", ethIntSocket, PIN_ETH_INT);
+}
+
 void ntpTask(void* param) {
   if (DEBUG_MODE) Serial.println("[ntpTask] Started");
 
@@ -811,6 +913,7 @@ void ntpTask(void* param) {
   ntpClient.forceUpdate();
 
   ntpServerUDP.begin(NTP_PORT);
+  setupEthInterrupt();
   if (DEBUG_MODE) Serial.println("[NTP] Listening on UDP 123");
 
   // Seed from fallback NTP so clock is usable before GPS fix
@@ -828,12 +931,30 @@ void ntpTask(void* param) {
 
   for (;;) {
     int packetSize = ntpServerUDP.parsePacket();
-    if (packetSize == NTP_PACKET_SIZE) {
+    t2IntUs = 0; t2LateUs = 0;
+    if (packetSize > 0 && ethIntSocket >= 0) {
+      // Consume-once: take the INTn arrival stamp, then re-arm INTn (clear RECV) for the next datagram
+      const uint64_t nowUs = esp_timer_get_time();
+      uint64_t s;
+      portENTER_CRITICAL(&ethIntMux);
+      s = lastEthIntMicros;
+      lastEthIntMicros = 0;
+      portEXIT_CRITICAL(&ethIntMux);
+      if (s != 0 && (nowUs - s) < ETH_INT_MAX_AGE_US) { t2IntUs = s; t2LateUs = (uint32_t)(nowUs - s); }
+      w5500Write(0x0002, (uint8_t)(4 * ethIntSocket + 1), 0x04);   // Sn_IR: clear RECV
+    } 
+	if (packetSize == NTP_PACKET_SIZE) {
       IPAddress remoteIp   = ntpServerUDP.remoteIP();
       uint16_t  remotePort = ntpServerUDP.remotePort();
       uint8_t   req[NTP_PACKET_SIZE];
       ntpServerUDP.read(req, NTP_PACKET_SIZE);
-      sendNtpResponse(remoteIp, remotePort, req);
+      const uint8_t reqVn   = (req[0] >> 3) & 0x07;
+      const uint8_t reqMode =  req[0]       & 0x07;
+      if (reqMode == 3 && reqVn >= 1 && reqVn <= 4) {   // RFC 5905 §9.2: only client requests (mode 3), VN 1-4
+        sendNtpResponse(remoteIp, remotePort, req);
+      } else if (DEBUG_MODE) {
+		Serial.printf("[NTP] Dropped: mode=%u vn=%u\n", reqMode, reqVn);
+      }
     } else if (packetSize > 0) {
       ntpServerUDP.flush();
       if (DEBUG_MODE) Serial.printf("[NTP] Discarded malformed packet (%d B)\n", packetSize);
@@ -965,10 +1086,11 @@ void displayTask(void* param) {
     display.display();
 
     if (DEBUG_MODE)
-      Serial.printf("[DISP] %s SAT:%d | %s | tAcc:%uns clkB:%dns | jam:%u ant:%u | LI:%u S:%u\n",
-                    fixStr, snap.satellites, timeBuf,
-                    snap.tAcc, snap.clkB,
-                    snap.jammingState, snap.antStatus, li, stratum);
+        Serial.printf("[DISP] %s SAT:%d | %s | tAcc:%uns clkB:%dns | jam:%u ant:%u | LI:%u S:%u fb:%u src:%s ppsStale:%d\n",
+            fixStr, snap.satellites, timeBuf,
+            snap.tAcc, snap.clkB,
+            snap.jammingState, snap.antStatus, li, stratum, (unsigned)ptFallbackCount,
+            srcStr, (int)isPpsStale());
 
     vTaskDelay(pdMS_TO_TICKS(500));
   }
